@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html lang="he" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#0b0b0d">
+<title>סיור תלת־ממדי</title>
+<link rel="modulepreload" href="./assets/lib/splat-viewer.js">
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  html,body { height:100%; overflow:hidden; background:#0b0b0d;
+              font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif; color:#fff; }
+  #stage { position:fixed; inset:0; touch-action:none; }
+  #stage canvas { display:block; }
+
+  #brand { position:fixed; top:calc(14px + env(safe-area-inset-top)); inset-inline-start:14px; z-index:10;
+           display:flex; align-items:center; gap:8px;
+           background:rgba(0,0,0,.55); -webkit-backdrop-filter:blur(8px); backdrop-filter:blur(8px);
+           padding:8px 14px; border-radius:999px; font-size:14px; max-width:60vw; }
+  #brand img { height:22px; width:auto; display:none; }
+  #brandName { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+
+  #rooms { position:fixed; bottom:0; inset-inline:0; z-index:10;
+           display:flex; gap:8px; overflow-x:auto; padding:14px 14px calc(22px + env(safe-area-inset-bottom));
+           background:linear-gradient(transparent,rgba(0,0,0,.75) 45%);
+           -webkit-overflow-scrolling:touch; scrollbar-width:none; }
+  #rooms::-webkit-scrollbar { display:none; }
+  .room { flex:0 0 auto; padding:11px 18px; border-radius:999px;
+          border:1px solid rgba(255,255,255,.22); background:rgba(255,255,255,.10);
+          color:#fff; font-size:15px; font-family:inherit; cursor:pointer; white-space:nowrap;
+          transition:background .18s, border-color .18s, color .18s; }
+  .room:active { background:rgba(255,255,255,.25); }
+  .room.active { background:#fff; color:#111; border-color:#fff; font-weight:600; }
+
+  #cta { position:fixed; top:calc(14px + env(safe-area-inset-top)); inset-inline-end:14px; z-index:10;
+         padding:10px 18px; border-radius:999px; background:#fff; color:#111;
+         font-size:14px; font-weight:600; text-decoration:none; }
+
+  #hint { position:fixed; z-index:9; bottom:calc(84px + env(safe-area-inset-bottom)); inset-inline:0;
+          text-align:center; font-size:13px; color:rgba(255,255,255,.75);
+          text-shadow:0 1px 6px rgba(0,0,0,.9); pointer-events:none;
+          transition:opacity .6s; }
+  #hint.hide { opacity:0; }
+
+  #loading { position:fixed; inset:0; z-index:20; display:flex;
+             flex-direction:column; align-items:center; justify-content:center;
+             gap:14px; background:#0b0b0d; transition:opacity .5s; }
+  #bar { width:200px; height:3px; background:rgba(255,255,255,.15); border-radius:2px; overflow:hidden; }
+  #barFill { height:100%; width:0%; background:#fff; border-radius:2px; transition:width .25s; }
+  #pct { font-size:12px; opacity:.55; font-variant-numeric:tabular-nums; }
+  #loading.done { opacity:0; pointer-events:none; }
+
+  #err { position:fixed; inset:0; z-index:30; display:none; padding:32px;
+         align-items:center; justify-content:center; text-align:center;
+         font-size:15px; line-height:1.8; background:#0b0b0d; }
+  #err code { background:rgba(255,255,255,.12); padding:2px 6px; border-radius:4px;
+              font-size:13px; direction:ltr; display:inline-block; }
+</style>
+</head>
+<body>
+
+<div id="stage"></div>
+
+<div id="brand"><img id="brandLogo" alt=""><span id="brandName">סיור תלת־ממדי</span></div>
+<a id="cta" href="#" style="display:none">צור קשר</a>
+<div id="hint">גרור כדי להסתובב · צבוט כדי להתקרב</div>
+<div id="rooms"></div>
+
+<div id="loading">
+  <div style="font-size:15px">טוען את הסיור…</div>
+  <div id="bar"><div id="barFill"></div></div>
+  <div id="pct">0%</div>
+</div>
+
+<div id="err"></div>
+
+<script type="module">
+const __t = { start: performance.now() };
+const { GaussianSplats3D, THREE } = await import('./assets/lib/splat-viewer.js');
+__t.module = performance.now();
+
+/* ------------------------------------------------------------------
+   הגדרות הנכס. זה החלק היחיד שמשתנה בין לקוח ללקוח.
+------------------------------------------------------------------- */
+const qs = new URLSearchParams(location.search);
+
+const CONFIG = {
+  splatUrl : qs.get('url') || './assets/scene.ksplat',
+
+  brandName: qs.get('brand') || 'סיור תלת־ממדי',
+  brandLogo: '',                       // נתיב ללוגו הסוכנות, ריק = בלי לוגו
+  ctaLabel : 'צור קשר',
+  ctaLink  : qs.get('cta') || '',      // tel: או wa.me של המתווך. ריק = מוסתר
+
+  // כיוון ה"מעלה" של הסצנה — נמדד מהדאטה עצמה (התאמת מישור הרצפה, RANSAC),
+  // לא נוחש. אם הסצנה נראית מוטה — זה הערך שצריך לתקן.
+  cameraUp : [-0.042, -0.895, -0.444],
+
+  // נקודות עצירה. camera = מיקום, target = לאן מסתכלים.
+  // איך מוצאים ערכים: מנווטים חופשי ומריצים dumpPose() בקונסולה.
+  waypoints: [
+    { name:'מבט כללי',      camera:[-1.30, 1.20, -2.60], target:[-0.62, 0.53, -0.84] },
+    { name:'הסלון',         camera:[-0.65, 1.49, -2.18], target:[-1.17, 0.84, -0.36] },
+    { name:'פינת הטלוויזיה', camera:[-0.65, 1.49, -2.18], target:[ 1.07, 1.17, -1.22] },
+    { name:'הספרייה',       camera:[-0.65, 1.49, -2.18], target:[ 1.32, 1.75, -2.42] }
+  ],
+
+  // נעילת מצלמה — המשתמש לא יוצא מהחלל.
+  limits: {
+    center     : [0.15, 1.07, -1.21],  // מרכז החדר, נמדד מהדאטה
+    minDistance: 0.5,
+    maxDistance: 2.4,
+    targetBox  : 1.4,                  // נקודת המיקוד לא בורחת מהחדר
+    minPolar   : 0.30,
+    maxPolar   : Math.PI - 0.30
+  },
+
+  transitionMs: 1400
+};
+
+/* ------------------------------------------------------------------ */
+
+const $ = id => document.getElementById(id);
+const fail = msg => { $('err').style.display = 'flex'; $('err').innerHTML = msg; $('loading').classList.add('done'); };
+
+$('brandName').textContent = CONFIG.brandName;
+document.title = CONFIG.brandName;
+if (CONFIG.brandLogo) { $('brandLogo').src = CONFIG.brandLogo; $('brandLogo').style.display = 'block'; }
+if (CONFIG.ctaLink)   { $('cta').href = CONFIG.ctaLink; $('cta').textContent = CONFIG.ctaLabel; $('cta').style.display = 'block'; }
+
+const isMobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent) ||
+                 (navigator.maxTouchPoints > 1 && /Macintosh/.test(navigator.userAgent));
+
+let viewer, camera, controls, flying = false;
+
+try {
+  viewer = new GaussianSplats3D.Viewer({
+    rootElement: $('stage'),
+    cameraUp: CONFIG.cameraUp,
+    initialCameraPosition: CONFIG.waypoints[0].camera,
+    initialCameraLookAt:   CONFIG.waypoints[0].target,
+
+    // GitHub/Cloudflare Pages לא מגישים כותרות COOP/COEP,
+    // ולכן אין SharedArrayBuffer. שני אלה חייבים ללכת יחד.
+    sharedMemoryForWorkers: false,
+    gpuAcceleratedSort: false,
+
+    // אופטימיזציה לנייד
+    halfPrecisionCovariancesOnGPU: true,
+    ignoreDevicePixelRatio: isMobile,
+    integerBasedSort: true,
+    sceneRevealMode: GaussianSplats3D.SceneRevealMode.Instant,
+    logLevel: GaussianSplats3D.LogLevel.None
+  });
+
+  __t.viewerCtor = performance.now();
+  await viewer.addSplatScene(CONFIG.splatUrl, {
+    showLoadingUI: false,
+    progressiveLoad: false,   // הבטחה נפתרת רק כשהסצנה שלמה — בלי חדר חצי-ריק
+    onProgress: (percent) => {
+      const p = Math.max(0, Math.min(100, Math.round(percent || 0)));
+      $('barFill').style.width = p + '%';
+      $('pct').textContent = p + '%';
+    }
+  });
+
+  __t.sceneLoaded = performance.now();
+  viewer.start();
+  __t.started = performance.now();
+  $('loading').classList.add('done');
+  window.__firstPaintMs = Math.round(__t.started);
+  window.__perf = {
+    moduleLoad : Math.round(__t.module - __t.start),
+    viewerCtor : Math.round(__t.viewerCtor - __t.module),
+    sceneLoad  : Math.round(__t.sceneLoaded - __t.viewerCtor),
+    startCall  : Math.round(__t.started - __t.sceneLoaded),
+    totalFromNav: Math.round(__t.started)
+  };
+  console.log('[perf]', JSON.stringify(window.__perf));
+  setTimeout(() => $('hint').classList.add('hide'), 4200);
+
+  camera   = viewer.camera;
+  controls = viewer.controls;
+
+  applyLimits();
+  buildRooms();
+  exposeDebug();
+
+} catch (e) {
+  console.error(e);
+  fail(`<div>
+    <b>הסצנה לא נטענה.</b><br><br>
+    בדוק שהקובץ קיים בנתיב <code>${CONFIG.splatUrl}</code>,
+    ושהעמוד מוגש דרך שרת ולא דרך <code>file://</code>.<br><br>
+    להרצה מקומית: <code>npx serve site</code><br><br>
+    <span style="opacity:.6;font-size:13px">${(e && e.message) ? String(e.message).slice(0,200) : ''}</span>
+  </div>`);
+}
+
+/* ---------- נעילת מצלמה: המשתמש לא מרחף מחוץ לקירות ---------- */
+
+function applyLimits() {
+  if (!controls) return;
+  const L = CONFIG.limits;
+  controls.minDistance = L.minDistance;
+  controls.maxDistance = L.maxDistance;
+  controls.minPolarAngle = L.minPolar;
+  controls.maxPolarAngle = L.maxPolar;
+  controls.enableDamping = true;
+  controls.dampingFactor = 0.08;
+  controls.rotateSpeed = 0.55;
+  controls.zoomSpeed = 0.8;
+  controls.panSpeed = 0.5;
+  controls.screenSpacePanning = true;
+
+  // גם אחרי pan — לא נותנים לנקודת המיקוד לברוח מהחדר.
+  const home = new THREE.Vector3(...L.center);
+  controls.addEventListener('change', () => {
+    if (flying) return;
+    const t = controls.target, b = L.targetBox;
+    t.x = Math.min(home.x + b, Math.max(home.x - b, t.x));
+    t.y = Math.min(home.y + b, Math.max(home.y - b, t.y));
+    t.z = Math.min(home.z + b, Math.max(home.z - b, t.z));
+  });
+}
+
+/* ---------- ניווט מונחה: זה מה שהופך את זה למוצר ולא לצעצוע ---------- */
+
+function buildRooms() {
+  const wrap = $('rooms');
+  wrap.innerHTML = '';
+  if (CONFIG.waypoints.length < 2) return;   // נקודה אחת = אין טעם בתפריט
+  CONFIG.waypoints.forEach((wp, i) => {
+    const b = document.createElement('button');
+    b.className = 'room' + (i === 0 ? ' active' : '');
+    b.textContent = wp.name;
+    b.onclick = () => {
+      wrap.querySelectorAll('.room').forEach(x => x.classList.remove('active'));
+      b.classList.add('active');
+      $('hint').classList.add('hide');
+      flyTo(wp);
+    };
+    wrap.appendChild(b);
+  });
+}
+
+function flyTo(wp) {
+  if (!camera || !controls) return;
+  flying = true;
+  const t0 = performance.now();
+  const from  = camera.position.clone();
+  const fromT = controls.target.clone();
+  const toX = wp.camera, toT = wp.target;
+  const ease = t => t < .5 ? 4*t*t*t : 1 - Math.pow(-2*t + 2, 3) / 2;
+
+  (function step() {
+    const k = Math.min(1, (performance.now() - t0) / CONFIG.transitionMs);
+    const e = ease(k);
+    camera.position.set(
+      from.x + (toX[0] - from.x) * e,
+      from.y + (toX[1] - from.y) * e,
+      from.z + (toX[2] - from.z) * e
+    );
+    controls.target.set(
+      fromT.x + (toT[0] - fromT.x) * e,
+      fromT.y + (toT[1] - fromT.y) * e,
+      fromT.z + (toT[2] - fromT.z) * e
+    );
+    controls.update();
+    if (k < 1) requestAnimationFrame(step);
+    else flying = false;
+  })();
+}
+
+/* עוזר לכיול: נווט לזווית שאתה רוצה והרץ dumpPose() בקונסולה. */
+function exposeDebug() {
+  window.dumpPose = () => {
+    const c = camera.position, t = controls.target;
+    const r = n => Math.round(n * 100) / 100;
+    const out = `{ name:'?', camera:[${r(c.x)}, ${r(c.y)}, ${r(c.z)}], target:[${r(t.x)}, ${r(t.y)}, ${r(t.z)}] },`;
+    console.log(out);
+    return out;
+  };
+  window.__viewer = viewer;
+  window.__three  = THREE;
+  console.log('%cטיפ: נווט לזווית שאתה רוצה והרץ dumpPose()', 'color:#7cf');
+}
+</script>
+</body>
+</html>
