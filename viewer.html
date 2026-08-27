@@ -12,7 +12,7 @@
     font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif;color:#fff}
   #stage{position:fixed;inset:0;touch-action:none;cursor:grab}
   #stage.dragging{cursor:grabbing}
-  #stage canvas{display:block}
+  #stage canvas{display:block;width:100%;height:100%}
 
   #brand{position:fixed;top:calc(14px + env(safe-area-inset-top));inset-inline-start:14px;z-index:10;
     display:flex;align-items:center;gap:8px;background:rgba(0,0,0,.55);
@@ -318,6 +318,10 @@ try {
   };
   addEventListener('resize', fit);
   addEventListener('orientationchange', () => setTimeout(fit, 250));
+  // ResizeObserver ולא רק אירוע resize: אם העמוד נטען כשה-layout עדיין
+  // 0x0 (קרה בפועל בטעינה מרוחקת), אירוע resize לא נורה אף פעם והקנבס
+  // נשאר תקוע בגודל קטן. המשקיף תופס גם את המקרה הזה.
+  if (window.ResizeObserver) new ResizeObserver(fit).observe($('stage'));
   fit();
   requestAnimationFrame(fit);
   setTimeout(fit, 400);
