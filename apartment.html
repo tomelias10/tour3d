@@ -1,0 +1,644 @@
+<!DOCTYPE html>
+<html lang="he" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="theme-color" content="#0b0b0d">
+<title>דירה לדוגמה · מודל תלת־ממדי</title>
+<link rel="modulepreload" href="./assets/lib/splat-viewer.js">
+<style>
+  *{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+  html,body{height:100%;overflow:hidden;background:#0b0b0d;
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif;color:#fff}
+  #stage{position:fixed;inset:0;touch-action:none;cursor:grab}
+  #stage.dragging{cursor:grabbing}
+  #stage canvas{display:block;width:100%;height:100%}
+
+  #brand{position:fixed;top:calc(14px + env(safe-area-inset-top));inset-inline-start:14px;z-index:10;
+    background:rgba(0,0,0,.55);-webkit-backdrop-filter:blur(8px);backdrop-filter:blur(8px);
+    padding:8px 14px;border-radius:999px;font-size:14px}
+  #cta{position:fixed;top:calc(14px + env(safe-area-inset-top));inset-inline-end:14px;z-index:10;
+    padding:10px 18px;border-radius:999px;background:#fff;color:#111;font-size:14px;
+    font-weight:600;text-decoration:none}
+
+  #rooms{position:fixed;bottom:0;inset-inline:0;z-index:10;display:flex;gap:8px;overflow-x:auto;
+    padding:14px 14px calc(20px + env(safe-area-inset-bottom));
+    background:linear-gradient(transparent,rgba(0,0,0,.78) 45%);
+    -webkit-overflow-scrolling:touch;scrollbar-width:none}
+  #rooms::-webkit-scrollbar{display:none}
+  .room{flex:0 0 auto;padding:11px 18px;border-radius:999px;border:1px solid rgba(255,255,255,.22);
+    background:rgba(255,255,255,.10);color:#fff;font-size:15px;font-family:inherit;cursor:pointer;
+    white-space:nowrap;transition:background .18s,color .18s}
+  .room:active{background:rgba(255,255,255,.25)}
+  .room.active{background:#fff;color:#111;border-color:#fff;font-weight:600}
+
+  #stick{position:fixed;z-index:11;inset-inline-start:22px;bottom:calc(86px + env(safe-area-inset-bottom));
+    width:118px;height:118px;border-radius:50%;background:rgba(255,255,255,.08);
+    border:1px solid rgba(255,255,255,.18);display:none;touch-action:none}
+  #knob{position:absolute;left:50%;top:50%;width:50px;height:50px;margin:-25px 0 0 -25px;
+    border-radius:50%;background:rgba(255,255,255,.85)}
+  body.touch #stick{display:block}
+
+  #hint{position:fixed;z-index:9;bottom:calc(78px + env(safe-area-inset-bottom));inset-inline:0;
+    text-align:center;font-size:13px;color:rgba(255,255,255,.8);
+    text-shadow:0 1px 8px rgba(0,0,0,.95);pointer-events:none;transition:opacity .6s;padding:0 16px}
+  #hint.hide{opacity:0}
+  #fps{position:fixed;z-index:10;top:calc(58px + env(safe-area-inset-top));inset-inline-end:16px;
+    font-size:11px;color:rgba(255,255,255,.45);font-variant-numeric:tabular-nums;display:none}
+  #fps.on{display:block}
+  #loading{position:fixed;inset:0;z-index:20;display:flex;align-items:center;justify-content:center;
+    background:#0b0b0d;transition:opacity .5s;font-size:15px}
+  #loading.done{opacity:0;pointer-events:none}
+</style>
+</head>
+<body>
+<div id="stage"></div>
+<div id="brand">דירה לדוגמה · מודל תלת־ממדי</div>
+<a id="cta" href="#" style="display:none">צור קשר</a>
+<div id="fps"></div>
+<div id="hint"></div>
+<div id="stick"><div id="knob"></div></div>
+<div id="rooms"></div>
+<div id="loading">בונה את הדירה…</div>
+
+<script type="module">
+const { THREE } = await import('./assets/lib/splat-viewer.js');
+const $ = id => document.getElementById(id);
+const qs = new URLSearchParams(location.search);
+
+const CFG = {
+  eyeHeight: 1.62,      // מטרים
+  walkSpeed: 2.6,
+  runMul   : 1.9,
+  radius   : 0.30,      // "רדיוס גוף" להתנגשות בקירות
+  stepUp   : 0.45,      // גובה מדרגה שאפשר לטפס עליה בלי לקפוץ
+  gravity  : 18,
+  showFps  : qs.get('fps') === '1',
+  tour     : qs.get('tour') === '1'
+};
+
+const WALL_H = 2.75, SLAB = 0.30, FLOOR2 = WALL_H + SLAB;   // גובה קומה שנייה
+
+/* ==================================================================
+   תוכנית הדירה. הכל במטרים, ציר X לרוחב, Z לעומק, Y לגובה.
+   שתי קומות של 12x9, מחוברות במדרגות.
+================================================================== */
+const PLAN = {
+  W: 12, D: 9,
+  rooms: [
+    // קומת קרקע
+    { name:'סלון',      floor:0, x:[0,6],   z:[0,5.4] },
+    { name:'מטבח',      floor:0, x:[6,12],  z:[0,4]   },
+    { name:'כניסה',     floor:0, x:[0,3.6], z:[5.4,9] },
+    { name:'שירותים',   floor:0, x:[9.6,12],z:[6.6,9] },
+    // קומה שנייה
+    { name:'חדר הורים', floor:1, x:[0,6],   z:[0,5]   },
+    { name:'חדר ילדים', floor:1, x:[6,12],  z:[0,4]   },
+    { name:'אמבטיה',    floor:1, x:[6,9.4], z:[4,7]   },
+    { name:'מרפסת',     floor:1, x:[9.4,12],z:[4,9], open:true }
+  ]
+};
+
+/* גובה הרצפה של כל קומה */
+const floorY = f => f===0 ? 0 : FLOOR2;
+
+/* ================== סצנה, מצלמה, אור ================== */
+const renderer = new THREE.WebGLRenderer({ antialias:true, powerPreference:'high-performance' });
+renderer.setPixelRatio(Math.min(devicePixelRatio||1, 2));
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.0;
+$('stage').appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x9fc6e8);
+const camera = new THREE.PerspectiveCamera(62, 1, 0.05, 200);
+
+// אור סביבה מ-environment map. בלי זה הקירות שלא פונים לשמש יוצאים
+// אפורים והתקרה שחורה — פנים של בית לא נראה ככה. זה מחליף את האור
+// המוחזר שקורה במציאות, וזה השדרוג הכי גדול ליחס עלות-תועלת כאן.
+function envTexture(){
+  const c=document.createElement('canvas'); c.width=128; c.height=64;
+  const g=c.getContext('2d');
+  const grad=g.createLinearGradient(0,0,0,64);
+  grad.addColorStop(0.00,'#bcdcff');
+  grad.addColorStop(0.45,'#ffffff');
+  grad.addColorStop(0.55,'#f0e6d8');
+  grad.addColorStop(1.00,'#6d6155');
+  g.fillStyle=grad; g.fillRect(0,0,128,64);
+  const t=new THREE.CanvasTexture(c);
+  t.mapping=THREE.EquirectangularReflectionMapping;
+  t.colorSpace=THREE.SRGBColorSpace;
+  return t;
+}
+const pmrem = new THREE.PMREMGenerator(renderer);
+pmrem.compileEquirectangularShader();
+scene.environment = pmrem.fromEquirectangular(envTexture()).texture;
+scene.environmentIntensity = 1.15;
+
+scene.add(new THREE.HemisphereLight(0xdfefff, 0x8a7d6d, 0.55));
+const sun = new THREE.DirectionalLight(0xfff4e2, 1.9);
+sun.position.set(14, 18, 9);
+sun.castShadow = true;
+sun.shadow.mapSize.set(2048,2048);
+sun.shadow.camera.near = 1; sun.shadow.camera.far = 60;
+const S = 16;
+sun.shadow.camera.left=-S; sun.shadow.camera.right=S;
+sun.shadow.camera.top=S;   sun.shadow.camera.bottom=-S;
+sun.shadow.bias = -0.0012;
+scene.add(sun);
+
+/* ================== חומרים ================== */
+// טקסטורת עץ פרוצדורלית — נותנת עומק בלי להוריד קובץ
+function woodTexture(){
+  const c=document.createElement('canvas'); c.width=c.height=512;
+  const g=c.getContext('2d');
+  g.fillStyle='#a9793f'; g.fillRect(0,0,512,512);
+  for(let i=0;i<512;i+=8){
+    g.fillStyle=`rgba(0,0,0,${0.03+Math.random()*0.05})`;
+    g.fillRect(0,i,512,1+Math.random()*3);
+  }
+  for(let i=0;i<1400;i++){
+    g.strokeStyle=`rgba(${90+Math.random()*60},${55+Math.random()*40},20,0.10)`;
+    g.beginPath();
+    const y=Math.random()*512;
+    g.moveTo(0,y); g.bezierCurveTo(170,y+Math.random()*10-5,340,y+Math.random()*10-5,512,y);
+    g.stroke();
+  }
+  const t=new THREE.CanvasTexture(c);
+  t.wrapS=t.wrapT=THREE.RepeatWrapping; t.repeat.set(4,3);
+  t.colorSpace=THREE.SRGBColorSpace;
+  return t;
+}
+function tileTexture(){
+  const c=document.createElement('canvas'); c.width=c.height=256;
+  const g=c.getContext('2d');
+  g.fillStyle='#e8e6e1'; g.fillRect(0,0,256,256);
+  g.strokeStyle='#cfcbc4'; g.lineWidth=4;
+  for(let i=0;i<=256;i+=64){ g.beginPath();g.moveTo(i,0);g.lineTo(i,256);g.stroke();
+                             g.beginPath();g.moveTo(0,i);g.lineTo(256,i);g.stroke(); }
+  const t=new THREE.CanvasTexture(c);
+  t.wrapS=t.wrapT=THREE.RepeatWrapping; t.repeat.set(6,5);
+  t.colorSpace=THREE.SRGBColorSpace;
+  return t;
+}
+
+const MAT = {
+  wall  : new THREE.MeshStandardMaterial({ color:0xf2ede4, roughness:0.95 }),
+  wood  : new THREE.MeshStandardMaterial({ map:woodTexture(), roughness:0.72 }),
+  tile  : new THREE.MeshStandardMaterial({ map:tileTexture(), roughness:0.42 }),
+  ceil  : new THREE.MeshStandardMaterial({ color:0xfbfaf7, roughness:1 }),
+  glass : new THREE.MeshPhysicalMaterial({ color:0xcfe6f5, transparent:true, opacity:0.22,
+            roughness:0.05, metalness:0, transmission:0.9 }),
+  metal : new THREE.MeshStandardMaterial({ color:0x8a8f96, roughness:0.35, metalness:0.85 }),
+  rail  : new THREE.MeshStandardMaterial({ color:0x2f3338, roughness:0.5, metalness:0.6 }),
+  darkwStair: new THREE.MeshStandardMaterial({ color:0x6d4c34, roughness:0.7 })
+};
+
+/* ================== עוזרים לבנייה ================== */
+const colliders = [];   // Box3 לקירות ורהיטים
+const floors    = [];   // מש-ים שאפשר לעמוד עליהם
+
+function box(w,h,d,mat,x,y,z,{collide=true,shadow=true,floor=false}={}){
+  const m=new THREE.Mesh(new THREE.BoxGeometry(w,h,d), mat);
+  m.position.set(x,y+h/2,z);
+  m.castShadow=shadow; m.receiveShadow=true;
+  scene.add(m);
+  if(collide) colliders.push(new THREE.Box3().setFromObject(m));
+  if(floor) floors.push(m);
+  return m;
+}
+
+// קיר עם פתחים. כל פתח הוא {start,width,bottom,top} לאורך הקיר —
+// דלת היא פתח מהרצפה, חלון הוא פתח שמתחיל בגובה אדן.
+function wall(x1,z1,x2,z2,y,opts={}){
+  const {openings=[], h=WALL_H, t=0.14, mat=MAT.wall} = opts;
+  const dx=x2-x1, dz=z2-z1;
+  const horiz = Math.abs(dx) >= Math.abs(dz);
+  const len = Math.hypot(dx,dz);
+  const ux = horiz ? (Math.sign(dx)||1) : 0;
+  const uz = horiz ? 0 : (Math.sign(dz)||1);
+
+  const put=(from,L,y0,y1)=>{
+    if(L<=0.02 || y1-y0<=0.02) return;
+    const cx = x1 + ux*(from+L/2), cz = z1 + uz*(from+L/2);
+    box(horiz?L:t, y1-y0, horiz?t:L, mat, cx, y+y0, cz);
+  };
+  const pane=(from,L,y0,y1)=>{
+    const cx = x1 + ux*(from+L/2), cz = z1 + uz*(from+L/2);
+    const g=new THREE.Mesh(new THREE.BoxGeometry(horiz?L:0.03, y1-y0, horiz?0.03:L), MAT.glass);
+    g.position.set(cx, y+y0+(y1-y0)/2, cz);
+    scene.add(g);
+  };
+
+  const ops=[...openings].sort((p,q)=>p.start-q.start);
+  let cur=0;
+  for(const o of ops){
+    put(cur, o.start-cur, 0, h);
+    put(o.start, o.width, 0, o.bottom);
+    put(o.start, o.width, o.top, h);
+    if(o.glass) pane(o.start, o.width, o.bottom, o.top);
+    cur = o.start + o.width;
+  }
+  put(cur, len-cur, 0, h);
+}
+const DOOR = (start,width=1.0) => ({start,width,bottom:0,top:2.05});
+const WIN  = (start,width=1.8) => ({start,width,bottom:0.95,top:2.25,glass:true});
+
+/* ================== בניית הדירה ================== */
+// פתח המדרגות. אותו חור משמש גם לרצפת הקומה העליונה וגם לתקרת
+// הקומה התחתונה — אחרת המדרגות מובילות לתוך תקרה אטומה.
+const HOLE = { x:[3.6,6.4], z:[5.4,9] };
+
+// לוח מלבני עם חור מלבני אופציונלי, בנוי מארבעה חלקים.
+function plate(y, thick, mat, {hole=null, isFloor=false, parts=null}={}){
+  const list = parts ? parts : (hole ? [
+    [0,PLAN.W, 0,hole.z[0]],
+    [0,PLAN.W, hole.z[1],PLAN.D],
+    [0,hole.x[0], hole.z[0],hole.z[1]],
+    [hole.x[1],PLAN.W, hole.z[0],hole.z[1]]
+  ] : [[0,PLAN.W, 0,PLAN.D]]);
+  for(const [x1,x2,z1,z2] of list){
+    const w=x2-x1, d=z2-z1;
+    if(w<=0.001 || d<=0.001) continue;
+    const m=new THREE.Mesh(new THREE.BoxGeometry(w,thick,d), mat);
+    m.position.set(x1+w/2, y+thick/2, z1+d/2);
+    m.receiveShadow=true; scene.add(m);
+    if(isFloor) floors.push(m);
+  }
+}
+
+function buildSlabs(){
+  plate(-SLAB, SLAB, MAT.wood, {isFloor:true});                       // רצפת קרקע
+  plate(WALL_H-0.11, 0.06, MAT.ceil, {hole:HOLE});                    // תקרת קרקע
+  plate(FLOOR2-SLAB, SLAB, MAT.wood, {hole:HOLE, isFloor:true});      // רצפת קומה 2
+  // גג — מדלג על המרפסת, שהיא פתוחה לשמיים
+  plate(FLOOR2+WALL_H-0.11, 0.06, MAT.ceil, {parts:[
+    [0,PLAN.W, 0,4],
+    [0,9.4,    4,PLAN.D]
+  ]});
+}
+
+function buildShell(){
+  // ---- קומת קרקע ----
+  wall(0,0,PLAN.W,0, 0, {openings:[WIN(1.6,2.6), WIN(7.4,2.0)]});      // חזית דרום
+  wall(0,PLAN.D,PLAN.W,PLAN.D, 0, {openings:[DOOR(5.2,1.1)]});          // כניסה
+  wall(0,0,0,PLAN.D, 0, {openings:[WIN(1.4,2.0)]});                     // מערב
+  wall(PLAN.W,0,PLAN.W,PLAN.D, 0, {openings:[WIN(1.0,1.6)]});           // מזרח
+  wall(6,0,6,4, 0, {openings:[DOOR(1.4,1.1)]});                         // סלון / מטבח
+  wall(0,5.4,3.6,5.4, 0, {openings:[DOOR(1.2,1.1)]});                   // סלון / כניסה
+  wall(9.6,6.6,12,6.6, 0, {openings:[DOOR(0.9,0.85)]});                 // שירותים
+  wall(9.6,6.6,9.6,9, 0);
+
+  // ---- קומה שנייה ----
+  wall(0,0,PLAN.W,0, FLOOR2, {openings:[WIN(1.6,2.6), WIN(7.4,2.0)]});
+  wall(0,0,0,PLAN.D, FLOOR2, {openings:[WIN(1.4,2.0)]});
+  wall(0,PLAN.D,9.4,PLAN.D, FLOOR2);
+  wall(PLAN.W,0,PLAN.W,4, FLOOR2, {openings:[WIN(1.0,1.6)]});
+  // מרפסת: מעקה במקום קיר
+  wall(PLAN.W,4,PLAN.W,PLAN.D, FLOOR2, {h:1.05});
+  wall(9.4,PLAN.D,PLAN.W,PLAN.D, FLOOR2, {h:1.05});
+
+  wall(6,0,6,4, FLOOR2, {openings:[DOOR(1.5,1.0)]});
+  wall(6,4,9.4,4, FLOOR2, {openings:[DOOR(1.2,0.9)]});
+  wall(9.4,4,9.4,PLAN.D, FLOOR2, {openings:[DOOR(2.2,1.2)]});           // יציאה למרפסת
+  wall(6,4,6,7, FLOOR2);
+  wall(6,7,9.4,7, FLOOR2);
+}
+
+function stairs(){
+  const steps=16, rise=FLOOR2/steps, run=0.28, wide=1.30;
+  const cx=4.80, z0=8.60;                       // מרכז המדרגות ותחילתן
+  const runTotal=(steps-1)*run;
+
+  for(let i=0;i<steps;i++){
+    const z=z0-i*run, y=i*rise;
+    // שלח
+    box(wide,0.06,run,MAT.wood, cx, y+rise-0.06, z, {floor:true, collide:false});
+    // רום — סוגר את החור מתחת לשלח, אחרת המדרגות נראות מרחפות
+    box(wide,rise-0.06,0.05,MAT.wood, cx, y, z-run/2+0.025, {collide:false});
+  }
+
+  // לוחות צד (stringers) לאורך האלכסון — הם שנותנים למדרגות גוף
+  const ang=Math.atan2(FLOOR2, runTotal);
+  const diag=Math.hypot(FLOOR2, runTotal);
+  for(const side of [-1,1]){
+    const st=new THREE.Mesh(new THREE.BoxGeometry(0.07, 0.34, diag+0.3), MAT.darkwStair);
+    st.position.set(cx+side*(wide/2+0.035), FLOOR2/2-0.02, z0-runTotal/2);
+    st.rotation.x=ang;   // המדרגות עולות ככל ש-z קטן
+    st.castShadow=true; st.receiveShadow=true; scene.add(st);
+  }
+
+  // מעקה: עמודים דלילים + מאחז יד רציף
+  for(const side of [-1,1]){
+    const x=cx+side*(wide/2+0.035);
+    for(let i=1;i<steps;i+=4){
+      box(0.045,0.92,0.045,MAT.rail, x, i*rise+rise-0.06, z0-i*run, {collide:false});
+    }
+    const hr=new THREE.Mesh(new THREE.BoxGeometry(0.055,0.055,diag+0.2), MAT.rail);
+    hr.position.set(x, FLOOR2/2+0.94, z0-runTotal/2);
+    hr.rotation.x=ang;
+    hr.castShadow=true; scene.add(hr);
+  }
+
+  // מעקה סביב פתח המדרגות בקומה העליונה
+  const y2=FLOOR2;
+  const edges=[[3.6,5.4,6.4,5.4],[3.6,9,3.6,5.4],[6.4,9,6.4,5.4]];
+  for(const [x1,z1,x2,z2] of edges){
+    const len=Math.hypot(x2-x1,z2-z1), horiz=Math.abs(x2-x1)>Math.abs(z2-z1);
+    const r=new THREE.Mesh(new THREE.BoxGeometry(horiz?len:0.05, 0.05, horiz?0.05:len), MAT.rail);
+    r.position.set((x1+x2)/2, y2+0.98, (z1+z2)/2); r.castShadow=true; scene.add(r);
+    const n=Math.max(2,Math.round(len/0.9));
+    for(let i=0;i<=n;i++){
+      const t=i/n, px=x1+(x2-x1)*t, pz=z1+(z2-z1)*t;
+      box(0.045,0.98,0.045,MAT.rail, px, y2, pz, {collide:false});
+    }
+  }
+}
+
+buildSlabs();
+buildShell();
+stairs();
+
+/* ================== ריהוט ==================
+   הכל קופסאות פשוטות, אבל עם פרופורציות אמיתיות במטרים. זה מה
+   שגורם לחלל להיקרא כבית ולא כתרשים.
+=========================================== */
+const M = {
+  sofa   : new THREE.MeshStandardMaterial({color:0x5b6470, roughness:0.9}),
+  cushion: new THREE.MeshStandardMaterial({color:0x7d8794, roughness:0.95}),
+  darkw  : new THREE.MeshStandardMaterial({color:0x4a352a, roughness:0.6}),
+  lightw : new THREE.MeshStandardMaterial({color:0xc9a97e, roughness:0.65}),
+  white  : new THREE.MeshStandardMaterial({color:0xf7f7f5, roughness:0.5}),
+  black  : new THREE.MeshStandardMaterial({color:0x17191c, roughness:0.35}),
+  rug    : new THREE.MeshStandardMaterial({color:0x8d6f5a, roughness:1}),
+  rug2   : new THREE.MeshStandardMaterial({color:0x6f7f86, roughness:1}),
+  bed    : new THREE.MeshStandardMaterial({color:0xe8e2d6, roughness:0.95}),
+  green  : new THREE.MeshStandardMaterial({color:0x3f7a45, roughness:0.85}),
+  pot    : new THREE.MeshStandardMaterial({color:0xb4674a, roughness:0.8}),
+  steel  : new THREE.MeshStandardMaterial({color:0xb9bec4, roughness:0.3, metalness:0.8})
+};
+const f = (w,h,d,mat,x,y,z,o) => box(w,h,d,mat,x,y,z,o);
+const rug = (w,d,mat,x,z,y=0) => {
+  const m=new THREE.Mesh(new THREE.BoxGeometry(w,0.02,d), mat);
+  m.position.set(x,y+0.012,z); m.receiveShadow=true; scene.add(m);
+};
+function plant(x,z,y=0,scale=1){
+  f(0.34*scale,0.32*scale,0.34*scale, M.pot, x,y,z,{collide:false});
+  for(let i=0;i<7;i++){
+    const a=i/7*Math.PI*2, L=0.55*scale;
+    const b=new THREE.Mesh(new THREE.BoxGeometry(0.06*scale,L,0.06*scale), M.green);
+    b.position.set(x+Math.cos(a)*0.10*scale, y+0.32*scale+L/2, z+Math.sin(a)*0.10*scale);
+    b.rotation.set(Math.cos(a)*0.35, 0, Math.sin(a)*0.35);
+    b.castShadow=true; scene.add(b);
+  }
+}
+
+function furnishGround(){
+  const y=0;
+  // --- סלון ---
+  rug(3.4,2.4,M.rug, 2.7,2.6);
+  f(2.30,0.62,0.92, M.sofa,    2.7,y,1.05);                  // ספה
+  f(2.30,0.55,0.22, M.cushion, 2.7,y+0.62,0.72,{collide:false});
+  f(0.22,0.48,0.92, M.cushion, 1.66,y+0.62,1.05,{collide:false});
+  f(0.22,0.48,0.92, M.cushion, 3.74,y+0.62,1.05,{collide:false});
+  f(1.15,0.38,0.60, M.lightw,  2.7,y,2.75);                  // שולחן סלון
+  f(1.85,0.45,0.42, M.darkw,   2.7,y,4.75);                  // מזנון
+  f(1.35,0.78,0.06, M.black,   2.7,y+0.55,4.80,{collide:false}); // טלוויזיה
+  plant(0.6,4.6);
+  f(0.12,1.55,0.12, M.black,   5.1,y,4.6,{collide:false});   // מנורת רצפה
+  f(0.34,0.26,0.34, M.white,   5.1,y+1.55,4.6,{collide:false});
+
+  // --- מטבח ---
+  f(5.60,0.90,0.62, M.white,   9.0,y,0.40);                  // שיש
+  f(5.60,0.05,0.64, M.darkw,   9.0,y+0.90,0.40,{collide:false});
+  f(5.20,0.70,0.35, M.white,   9.0,y+1.55,0.22,{collide:false}); // ארונות עליונים
+  f(0.52,0.14,0.42, M.steel,   8.2,y+0.90,0.40,{collide:false}); // כיור
+  f(0.72,1.85,0.68, M.steel,  11.4,y,0.55);                  // מקרר
+  f(1.70,0.90,0.85, M.lightw,  8.8,y,2.45);                  // אי
+  f(1.74,0.05,0.89, M.darkw,   8.8,y+0.90,2.45,{collide:false});
+  for(const sx of [8.2,9.4]){                                 // שרפרפים
+    f(0.34,0.68,0.34, M.darkw, sx,y,3.25,{collide:false});
+  }
+
+  // --- כניסה ---
+  f(1.05,0.80,0.35, M.darkw,   1.0,y,8.55);                  // קונסולה
+  f(0.70,1.05,0.05, M.white,   1.0,y+1.10,8.80,{collide:false}); // מראה
+  plant(3.1,8.4,0,0.9);
+
+  // --- שירותים ---
+  f(0.45,0.72,0.62, M.white,  11.4,y,7.2);                   // אסלה
+  f(0.60,0.18,0.42, M.white,  10.2,y+0.72,7.0,{collide:false}); // כיור
+}
+
+function furnishUpper(){
+  const y=FLOOR2;
+  // --- חדר הורים ---
+  rug(3.0,2.2,M.rug2, 2.6,3.1,y);
+  f(1.65,0.32,2.05, M.darkw,  2.6,y,1.45);                   // בסיס מיטה
+  f(1.60,0.24,1.95, M.bed,    2.6,y+0.32,1.45,{collide:false});
+  f(1.50,0.16,0.42, M.white,  2.6,y+0.56,0.62,{collide:false}); // כריות
+  f(1.10,0.90,0.06, M.lightw, 2.6,y+0.30,0.36,{collide:false}); // ראש מיטה
+  for(const sx of [1.55,3.65]){
+    f(0.42,0.46,0.38, M.lightw, sx,y,0.62,{collide:false});
+    f(0.16,0.30,0.16, M.white,  sx,y+0.46,0.62,{collide:false});
+  }
+  f(1.90,2.15,0.58, M.white,  4.85,y,4.55);                  // ארון
+
+  // --- חדר ילדים ---
+  f(1.00,0.30,1.95, M.darkw,  7.0,y,1.35);
+  f(0.95,0.22,1.85, M.bed,    7.0,y+0.30,1.35,{collide:false});
+  f(1.30,0.74,0.60, M.lightw, 10.6,y,0.55);                  // שולחן כתיבה
+  f(0.42,0.46,0.42, M.darkw,  10.6,y,1.35,{collide:false});  // כיסא
+  f(1.20,1.05,0.32, M.white,  10.2,y+1.35,0.30,{collide:false}); // מדף
+  plant(11.5,3.3,y,0.8);
+
+  // --- אמבטיה ---
+  f(1.70,0.55,0.75, M.white,  7.0,y,4.6);                    // אמבטיה
+  f(0.60,0.18,0.42, M.white,  8.9,y+0.72,4.5,{collide:false});
+  f(0.45,0.72,0.62, M.white,  8.9,y,6.4);
+
+  // --- מרפסת ---
+  f(0.80,0.72,0.80, M.lightw, 10.5,y,5.6,{collide:false});   // שולחן
+  for(const [cx,cz] of [[10.5,4.8],[10.5,6.4]]){
+    f(0.44,0.44,0.44, M.darkw, cx,y,cz,{collide:false});
+  }
+  plant(11.4,8.2,y,1.1);
+}
+furnishGround();
+furnishUpper();
+
+
+
+window.__scene=scene; window.__colliders=colliders; window.__floors=floors;
+console.log('[apartment] colliders', colliders.length, 'floors', floors.length);
+
+/* ==================================================================
+   הליכה: כוח כבידה, התנגשות בקירות, וטיפוס מדרגות.
+   הגובה נקבע בקרן שנורית מטה — ככה מדרגות עובדות בלי קוד מיוחד.
+================================================================== */
+const down = new THREE.Raycaster();
+down.far = 6;
+
+class Player {
+  constructor(){
+    // ?at=x,z,yaw  — פתיחה בנקודה מסוימת. שימושי גם לשליחת לינק
+    // ישירות לחדר מסוים, וגם לבדיקות.
+    const at=(qs.get('at')||'').split(',').map(Number);
+    const ok = at.length>=2 && at.every(n=>Number.isFinite(n));
+    this.pos = new THREE.Vector3(ok?at[0]:1.5, 0, ok?at[1]:4.5);
+    this.vy = 0; this.onGround = false;
+    this.yaw = (ok && at.length>2) ? at[2] : 2.41;   // פתיחה בסלון, מבט לכיוון המטבח
+    this.pitch = -0.02;
+    this.keys = new Set(); this.stick = {x:0,y:0};
+    this.pos.y = this.groundAt(this.pos.x, this.pos.z, (qs.get('f')==='1'?FLOOR2:0)+2.5) + CFG.eyeHeight;
+    this.bind();
+  }
+  // גובה הרצפה מתחת לנקודה. fromY = מאיפה יורים את הקרן.
+  groundAt(x, z, fromY){
+    down.set(new THREE.Vector3(x, fromY, z), new THREE.Vector3(0,-1,0));
+    const hits = down.intersectObjects(floors, false);
+    return hits.length ? hits[0].point.y : 0;
+  }
+  blocked(x, y, z){
+    const r = CFG.radius, feet = y - CFG.eyeHeight, head = y + 0.12;
+    for(const b of colliders){
+      if(x > b.min.x - r && x < b.max.x + r &&
+         z > b.min.z - r && z < b.max.z + r &&
+         head > b.min.y && feet < b.max.y) return true;
+    }
+    return false;
+  }
+  move(dx, dz){
+    const p = this.pos;
+    if(!this.blocked(p.x+dx, p.y, p.z+dz)){ p.x+=dx; p.z+=dz; return; }
+    if(!this.blocked(p.x+dx, p.y, p.z))    { p.x+=dx; return; }   // החלקה לאורך קיר
+    if(!this.blocked(p.x, p.y, p.z+dz))    { p.z+=dz; }
+  }
+  forward(){ return new THREE.Vector3(Math.sin(this.yaw),0,Math.cos(this.yaw)); }
+  right(){   return new THREE.Vector3(Math.cos(this.yaw),0,-Math.sin(this.yaw)); }
+
+  update(dt){
+    const k=this.keys;
+    let ix=(k.has('d')||k.has('arrowright')?1:0)-(k.has('a')||k.has('arrowleft')?1:0);
+    let iy=(k.has('w')||k.has('arrowup')?1:0)-(k.has('s')||k.has('arrowdown')?1:0);
+    ix+=this.stick.x; iy-=this.stick.y;
+    const dir=new THREE.Vector3()
+      .addScaledVector(this.forward(), iy)
+      .addScaledVector(this.right(),  ix);
+    if(dir.lengthSq()>1) dir.normalize();
+    const sp = CFG.walkSpeed * (k.has('shift')?CFG.runMul:1) * dt;
+    if(dir.lengthSq()>1e-8) this.move(dir.x*sp, dir.z*sp);
+
+    // כוח כבידה + טיפוס מדרגה
+    const feet = this.pos.y - CFG.eyeHeight;
+    const g = this.groundAt(this.pos.x, this.pos.z, feet + CFG.stepUp + 0.5);
+    if(feet <= g + 0.02 || (g - feet > 0 && g - feet < CFG.stepUp)){
+      this.pos.y = g + CFG.eyeHeight; this.vy = 0; this.onGround = true;
+    } else {
+      this.vy -= CFG.gravity*dt;
+      this.pos.y += this.vy*dt;
+      if(this.pos.y - CFG.eyeHeight < g){ this.pos.y = g + CFG.eyeHeight; this.vy=0; this.onGround=true; }
+      else this.onGround=false;
+    }
+    camera.position.copy(this.pos);
+    const look=this.forward().multiplyScalar(Math.cos(this.pitch));
+    look.y=Math.sin(this.pitch);
+    camera.lookAt(this.pos.clone().add(look));
+  }
+  teleport(x,z,f){
+    this.pos.set(x, floorY(f)+CFG.eyeHeight+0.05, z);
+    this.pos.y = this.groundAt(x,z,floorY(f)+2) + CFG.eyeHeight;
+    this.vy=0;
+  }
+  bind(){
+    const stage=$('stage');
+    addEventListener('keydown',e=>{
+      if(['ArrowUp','ArrowDown','ArrowLeft','ArrowRight',' '].includes(e.key)) e.preventDefault();
+      this.keys.add(e.key.toLowerCase());
+    });
+    addEventListener('keyup',e=>this.keys.delete(e.key.toLowerCase()));
+    addEventListener('blur',()=>this.keys.clear());
+    let drag=false,lx=0,ly=0;
+    const dn=e=>{const t=e.touches?e.touches[0]:e;drag=true;lx=t.clientX;ly=t.clientY;stage.classList.add('dragging');};
+    const mv=e=>{ if(!drag)return; const t=e.touches?e.touches[0]:e;
+      this.yaw   -= (t.clientX-lx)*0.0040;
+      this.pitch -= (t.clientY-ly)*0.0040;
+      this.pitch = Math.max(-1.2, Math.min(1.2, this.pitch));
+      lx=t.clientX; ly=t.clientY; $('hint').classList.add('hide'); };
+    const up=()=>{drag=false;stage.classList.remove('dragging');};
+    stage.addEventListener('mousedown',dn); addEventListener('mousemove',mv); addEventListener('mouseup',up);
+    stage.addEventListener('touchstart',dn,{passive:true});
+    stage.addEventListener('touchmove',mv,{passive:true});
+    stage.addEventListener('touchend',up);
+
+    const stick=$('stick'), knob=$('knob');
+    let sid=null,cx=0,cy=0,R=52;
+    const sS=e=>{const t=e.changedTouches[0];sid=t.identifier;
+      const r=stick.getBoundingClientRect();cx=r.left+r.width/2;cy=r.top+r.height/2;sM(e);};
+    const sM=e=>{ for(const t of e.changedTouches){ if(t.identifier!==sid) continue;
+      let dx=t.clientX-cx,dy=t.clientY-cy; const d=Math.hypot(dx,dy);
+      if(d>R){dx*=R/d;dy*=R/d;}
+      knob.style.transform=`translate(${dx}px,${dy}px)`;
+      this.stick.x=dx/R; this.stick.y=dy/R; $('hint').classList.add('hide'); } };
+    const sE=()=>{sid=null;this.stick.x=this.stick.y=0;knob.style.transform='';};
+    stick.addEventListener('touchstart',sS,{passive:true});
+    stick.addEventListener('touchmove',sM,{passive:true});
+    stick.addEventListener('touchend',sE); stick.addEventListener('touchcancel',sE);
+  }
+}
+
+const player = new Player();
+
+/* ================== תפריט חדרים ================== */
+const wrap=$('rooms');
+PLAN.rooms.forEach((r,i)=>{
+  const b=document.createElement('button');
+  b.className='room'+(i===0?'':'');
+  b.textContent=r.name;
+  b.onclick=()=>{
+    wrap.querySelectorAll('.room').forEach(x=>x.classList.remove('active'));
+    b.classList.add('active'); $('hint').classList.add('hide');
+    player.teleport((r.x[0]+r.x[1])/2, (r.z[0]+r.z[1])/2, r.floor);
+  };
+  wrap.appendChild(b);
+});
+
+const isTouch = matchMedia('(hover:none)').matches || navigator.maxTouchPoints>1;
+if(isTouch) document.body.classList.add('touch');
+$('hint').textContent = isTouch
+  ? 'גרור כדי להסתכל · ג׳ויסטיק כדי ללכת · עלה במדרגות לקומה השנייה'
+  : 'W A S D ללכת · גרירה להסתכל · עלה במדרגות לקומה השנייה';
+if(CFG.showFps) $('fps').classList.add('on');
+setTimeout(()=>$('hint').classList.add('hide'), 7000);
+
+/* ================== גודל וקצב ================== */
+function fit(){
+  const w=$('stage').clientWidth||innerWidth||0, h=$('stage').clientHeight||innerHeight||0;
+  if(w<=0||h<=0) return;
+  renderer.setSize(w,h,false);
+  camera.aspect=w/h; camera.updateProjectionMatrix();
+}
+addEventListener('resize',fit);
+addEventListener('orientationchange',()=>setTimeout(fit,250));
+if(window.ResizeObserver) new ResizeObserver(fit).observe($('stage'));
+fit();
+
+let last=performance.now(), acc=0, frames=0;
+(function loop(now){
+  requestAnimationFrame(loop);
+  const dt=Math.min(0.05,(now-last)/1000); last=now;
+  if(!window.__loopOff) player.update(dt);   // __loopOff=true לבדיקות מצלמה
+  renderer.render(scene,camera);
+  if(CFG.showFps){ acc+=dt; frames++;
+    if(acc>=0.5){ $('fps').textContent=Math.round(frames/acc)+' fps'; acc=0; frames=0; } }
+})(performance.now());
+
+window.__player=player; window.__camera=camera; window.__renderer=renderer;
+
+$('loading').classList.add('done');
+</script>
+</body>
+</html>
