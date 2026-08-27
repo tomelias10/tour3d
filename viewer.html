@@ -96,6 +96,11 @@ const CONFIG = {
   ctaLabel : 'צור קשר',
   ctaLink  : qs.get('cta') || '',
 
+  // שמות נקודות העצירה. הנגן מוצא את הנקודות לבד, אבל הוא לא יודע
+  // איזה חדר זה — אז לכל לקוח ממלאים כאן את השמות האמיתיים, לפי הסדר
+  // שבו הכפתורים מופיעים. ריק = שמות גנריים.
+  roomNames: [],
+
   // גובה עיניים ומהירות הליכה — במטרים אמיתיים.
   // הנגן מחשב לבד את קנה המידה של הסצנה וממיר.
   eyeHeightM : 1.60,
@@ -133,6 +138,12 @@ class WalkController {
     this.eye   = cal.planeD + cal.hFloor + cfg.eyeHeightM*cal.unitsPerMeter;
 
     const spots=cal.openSpots(6);
+    // openSpots ממיין לפי מרווח פנוי, וזה נותן נקודת פתיחה צמודה לחלון:
+    // המבט הראשון יוצא כתם לבן שרוף. הנקודה שהכי קרובה למרכז השטח
+    // ההליך היא זו שמראה את החדר. אותה שמים ראשונה.
+    if(cal.walkCenter && spots.length>1){
+      spots.sort((a,b)=>a.distanceTo(cal.walkCenter)-b.distanceTo(cal.walkCenter));
+    }
     this.spots=spots;
     this.pos = (spots[0] || new THREE.Vector3()).clone();
     this.lookAtBestView();
@@ -140,6 +151,15 @@ class WalkController {
   }
   // מסתובבים לכיוון שבו יש הכי הרבה חלל פתוח — לא לתוך קיר
   lookAtBestView(){
+    // קודם כל: להסתכל למרכז החדר. "הכיוון הכי פתוח" נשמע נכון אבל בפועל
+    // הוא מכוון לחלון או לדלת — כלומר לכתם לבן שרוף במקום לחדר.
+    if(this.cal.walkCenter){
+      const d=this.cal.walkCenter.clone().sub(this.pos);
+      const a=d.dot(this.cal.e1), b=d.dot(this.cal.e2);
+      if(Math.hypot(a,b) > 0.4*this.cal.unitsPerMeter){
+        this.yaw=Math.atan2(b,a); this.pitch=-0.04; return;
+      }
+    }
     let best=-1,bestYaw=0;
     for(let d=0;d<360;d+=15){
       const y=d*Math.PI/180; let clear=0;
@@ -281,6 +301,26 @@ try {
   camera = viewer.camera;
   const cal = calibrate(viewer, THREE);     // רצפה, גובה, מפת הליכה
   const ctl = new WalkController(camera, THREE, cal, CONFIG);
+
+  // גודל הקנבס. הנגן קובע אותו פעם אחת בזמן היצירה, ואם ה-layout עדיין
+  // לא התייצב אז (קרה בפועל בטעינה מרוחקת) הסצנה נשארת בפינה קטנה.
+  // מכריחים התאמה אחרי הטעינה, בכל שינוי גודל, ובסיבוב מסך בנייד.
+  const fit = () => {
+    const el = $('stage');
+    const w = el.clientWidth  || window.innerWidth  || 0;
+    const h = el.clientHeight || window.innerHeight || 0;
+    if (w <= 0 || h <= 0) return;          // אל תכווץ את הקנבס ל-0
+    if (viewer.renderer) viewer.renderer.setSize(w, h, false);
+    if (viewer.camera && viewer.camera.isPerspectiveCamera) {
+      viewer.camera.aspect = w / h;
+      viewer.camera.updateProjectionMatrix();
+    }
+  };
+  addEventListener('resize', fit);
+  addEventListener('orientationchange', () => setTimeout(fit, 250));
+  fit();
+  requestAnimationFrame(fit);
+  setTimeout(fit, 400);
   buildRooms(cal, ctl);
   startLoop(viewer, ctl);
 
@@ -320,33 +360,59 @@ function calibrate(viewer, THREE){
   const nrm=a=>{const l=Math.hypot(...a);return l?[a[0]/l,a[1]/l,a[2]/l]:null;};
   const diag = Math.hypot(hi[0]-lo[0],hi[1]-lo[1],hi[2]-lo[2]);
   const TH = diag*0.004;
-  const SS = 11;                                  // דגימה לספירת inliers
+  const SS = 11;
   const nSamp = Math.ceil(P.length/SS);
-  let best=null, bestAny=null;
-  for(let it=0;it<3000;it++){
-    const a=P[(Math.random()*P.length)|0],b=P[(Math.random()*P.length)|0],c=P[(Math.random()*P.length)|0];
-    let n=nrm(cross(sub(b,a),sub(c,a))); if(!n) continue;
-    let d=dot(n,a), inl=0, above=0;
-    for(let s=0;s<P.length;s+=SS){
-      const t=dot(n,P[s])-d;
+
+  // RNG דטרמיניסטי: בלי זה הכיול יוצא אחרת בכל טעינה, ופעם אחת מתוך
+  // כמה הוא בוחר קיר במקום רצפה. עדיף תוצאה קבועה שאפשר לבדוק.
+  let rngState = 0x9e3779b9;
+  const rnd = () => { rngState|=0; rngState=rngState+0x6D2B79F5|0;
+    let t=Math.imul(rngState^rngState>>>15,1|rngState);
+    t=t+Math.imul(t^t>>>7,61|t)^t;
+    return ((t^t>>>14)>>>0)/4294967296; };
+  const pick = () => P[(rnd()*P.length)|0];
+
+  // אורך הסצנה לאורך נורמל נתון (עמיד לחריגים)
+  const extentAlong = n => {
+    const ds=[]; for(let i=0;i<P.length;i+=7) ds.push(dot(n,P[i]));
+    ds.sort((x,y)=>x-y);
+    return ds[Math.floor(ds.length*0.98)] - ds[Math.floor(ds.length*0.02)];
+  };
+
+  // אוספים מועמדים ומאחדים כיוונים דומים
+  const cands=[];
+  for(let it=0;it<2600;it++){
+    const a1=pick(),b1=pick(),c1=pick();
+    let n=nrm(cross(sub(b1,a1),sub(c1,a1))); if(!n) continue;
+    let d=dot(n,a1), inl=0, above=0;
+    for(let s2=0;s2<P.length;s2+=SS){
+      const t=dot(n,P[s2])-d;
       if(Math.abs(t)<TH) inl++;
       if(t>0) above++;
     }
     let frac=above/nSamp;
-    if(frac<0.5){ n=n.map(x=>-x); d=-d; frac=1-frac; }   // הנורמל תמיד כלפי המסה
-    if(!bestAny || inl>bestAny.inl) bestAny={n,d,inl};
-    // רצפה = המישור הגדול ביותר שכמעט כל הסצנה נמצאת מעליו.
-    // הסינון על frac מוציא קירות; הדירוג עצמו הוא לפי גודל המישור בלבד,
-    // כי קיר בקצה הסצנה גם הוא "כל המסה בצד אחד".
-    if(frac>=0.72 && (!best || inl>best.inl)) best={n,d,inl};
+    if(frac<0.5){ n=n.map(x=>-x); d=-d; frac=1-frac; }
+    const hit=cands.find(c=>Math.abs(dot(c.n,n))>0.90);
+    if(hit){ if(inl>hit.inl){ hit.n=n; hit.d=d; hit.inl=inl; hit.frac=frac; } }
+    else cands.push({n,d,inl,frac});
   }
-  const chosen = best || bestAny;
+
+  // בחירת הרצפה. הסינון על frac מוציא מישורים באמצע הסצנה, אבל קיר
+  // בקצה עובר אותו בקלות — ולכן ההכרעה היא לפי *העובי* של הסצנה לאורך
+  // הנורמל: בחדר, רצפה-תקרה הוא תמיד הממד הקטן ביותר, בעוד שקיר
+  // "מסתכל" לאורך כל אורך החדר. זה מה שהפיל את הגרסה הקודמת.
+  const viable = cands.filter(c=>c.frac>=0.70 && c.inl>0);
+  for(const c of viable) c.ext = extentAlong(c.n);
+  viable.sort((x,y)=> (x.ext-y.ext) || (y.inl-x.inl));
+  const chosen = viable[0] || cands.sort((x,y)=>y.inl-x.inl)[0];
+
   let up = chosen ? chosen.n.slice() : [0,-1,0];
   let planeD = chosen ? chosen.d : 0;
+  { let above=0; for(const q of P) if(dot(up,q)-planeD>0) above++;
+    if(above < P.length/2){ up=up.map(x=>-x); planeD=-planeD; } }
 
-  // RANSAC בוחר מישור משלוש נקודות אקראיות, ולכן הנורמל קופץ קצת בין
-  // ריצה לריצה (אופק מוטה). מיישרים אותו: לוקחים את כל ה-inliers
-  // ומתאימים להם מישור בריבועים פחותים, דרך הווקטור העצמי הקטן ביותר.
+  // ליטוש: RANSAC בוחר מישור משלוש נקודות אקראיות, אז הנורמל גס.
+  // מתאימים מישור לכל ה-inliers בריבועים פחותים כדי ליישר את האופק.
   if (chosen) {
     const inl=[];
     for(const q of P) if(Math.abs(dot(up,q)-planeD) < TH) inl.push(q);
@@ -364,14 +430,13 @@ function calibrate(viewer, THREE){
       const mul=(M,v)=>[M[0]*v[0]+M[1]*v[1]+M[2]*v[2],
                         M[3]*v[0]+M[4]*v[1]+M[5]*v[2],
                         M[6]*v[0]+M[7]*v[1]+M[8]*v[2]];
-      // שני הכיוונים הדומיננטיים פורשים את המישור; הנורמל הוא המכפלה שלהם
-      const pit=(M,seed)=>{ let v=seed;
+      const pit=(M,sd)=>{ let v=sd;
         for(let k=0;k<40;k++){ const w=mul(M,v); const n2=nrm(w); if(!n2) break; v=n2; }
         return v; };
       const v1=pit(C,[1,0,0]);
       const l1=dot(v1,mul(C,v1));
       const D=C.slice();
-      for(let r=0;r<3;r++)for(let c=0;c<3;c++) D[r*3+c]-=l1*v1[r]*v1[c];   // deflation
+      for(let r=0;r<3;r++)for(let c2=0;c2<3;c2++) D[r*3+c2]-=l1*v1[r]*v1[c2];
       const v2=pit(D,[0,1,0]);
       const n3=nrm(cross(v1,v2));
       if(n3){
@@ -380,8 +445,6 @@ function calibrate(viewer, THREE){
       }
     }
   }
-  { let above=0; for(const p of P) if(dot(up,p)-planeD>0) above++;
-    if(above < P.length/2){ up=up.map(x=>-x); planeD=-planeD; } }
 
   // --- קנה מידה: גובה החדר (רצפה עד תקרה) ≈ 2.6 מטר
   const heights = P.map(p=>dot(up,p)-planeD).sort((a,b)=>a-b);
@@ -417,8 +480,16 @@ function calibrate(viewer, THREE){
   const walkable=new Uint8Array(W*H);
   for(let k=0;k<W*H;k++) walkable[k] = (!blocked[k] && floorHits[k]>0) ? 1 : 0;
 
+  // מרכז השטח ההליך — לשם מכוונים את המבט הראשון
+  let sc1=0, sc2=0, scn=0;
+  for(let j=0;j<H;j++)for(let i=0;i<W;i++) if(walkable[j*W+i]){
+    sc1+=min1+(i+.5)*cell; sc2+=min2+(j+.5)*cell; scn++;
+  }
+  const walkCenter = scn ? new THREE.Vector3()
+      .addScaledVector(E1, sc1/scn).addScaledVector(E2, sc2/scn) : null;
+
   return {
-    up:U, e1:E1, e2:E2, planeD, hFloor, unitsPerMeter, diag,
+    up:U, e1:E1, e2:E2, planeD, hFloor, unitsPerMeter, diag, walkCenter,
     grid:{walkable,W,H,min1,min2,cell},
     isWalkable(v){
       const i=Math.floor((v.dot(E1)-min1)/cell), j=Math.floor((v.dot(E2)-min2)/cell);
@@ -460,11 +531,12 @@ function calibrate(viewer, THREE){
 /* ================== תפריט חדרים (טלפורט לנקודות פתוחות) ================== */
 function buildRooms(cal, ctl){
   const wrap=$('rooms'); wrap.innerHTML='';
-  const names=['כניסה','סלון','פינת אוכל','מטבח','חדר שינה','מרפסת'];
+  const custom = Array.isArray(CONFIG.roomNames) ? CONFIG.roomNames : [];
+  const fallback = i => i===0 ? 'מבט כללי' : ('נקודה ' + (i+1));
   ctl.spots.forEach((v,i)=>{
     const b=document.createElement('button');
     b.className='room'+(i===0?' active':'');
-    b.textContent=names[i]||('נקודה '+(i+1));
+    b.textContent = custom[i] || fallback(i);
     b.onclick=()=>{
       wrap.querySelectorAll('.room').forEach(x=>x.classList.remove('active'));
       b.classList.add('active'); $('hint').classList.add('hide');
