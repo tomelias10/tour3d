@@ -107,7 +107,11 @@ const CONFIG = {
   walkSpeedMS: 1.35,
   runMultiplier: 2.1,
 
-  showFps: qs.get('fps') === '1'
+  showFps: qs.get('fps') === '1',
+
+  // ?tour=1 — מצב הקלטה: הנגן הולך לבד בין הנקודות, בלי ממשק על המסך.
+  // בשביל להקליט סרטון לרילס/טיקטוק בלי לצלם את האצבע על הג'ויסטיק.
+  tour: qs.get('tour') === '1'
 };
 
 const $ = id => document.getElementById(id);
@@ -118,6 +122,10 @@ document.title = CONFIG.brandName;
 if (CONFIG.brandLogo){ $('brandLogo').src=CONFIG.brandLogo; $('brandLogo').style.display='block'; }
 if (CONFIG.ctaLink){ $('cta').href=CONFIG.ctaLink; $('cta').textContent=CONFIG.ctaLabel; $('cta').style.display='block'; }
 if (CONFIG.showFps) $('fps').classList.add('on');
+if (CONFIG.tour){
+  for (const id of ['rooms','stick','hint','cta']) $(id).style.display='none';
+  document.body.classList.remove('touch');
+}
 
 const isTouch = matchMedia('(hover:none)').matches || navigator.maxTouchPoints > 1;
 if (isTouch) document.body.classList.add('touch');
@@ -147,6 +155,7 @@ class WalkController {
     this.spots=spots;
     this.pos = (spots[0] || new THREE.Vector3()).clone();
     this.lookAtBestView();
+    this.tourIdx = 1;                    // לאן הולכים עכשיו במצב סיור
     this.bind();
   }
   // מסתובבים לכיוון שבו יש הכי הרבה חלל פתוח — לא לתוך קיר
@@ -244,7 +253,47 @@ class WalkController {
     const c2=p.clone().add(g); if(this.cal.isWalkable(c2)){ p.copy(c2); }
   }
   teleport(v){ this.pos.copy(v); this.lookAtBestView(); }
+  // הליכה אוטומטית בין הנקודות. משתמשת באותו tryMove כמו הליכה ידנית,
+  // כך שגם הסיור האוטומטי לא עובר דרך קירות.
+  updateTour(dt){
+    if(this.spots.length<2) return;
+    const T=this.T;
+    const goal=this.spots[this.tourIdx % this.spots.length];
+    const to=goal.clone().sub(this.pos);
+    const flat=to.clone().projectOnPlane(this.cal.up);
+    if(flat.length() < 0.55*this.cal.unitsPerMeter){
+      this.tourIdx=(this.tourIdx+1)%this.spots.length;
+      return;
+    }
+    // מסובבים את המבט לכיוון ההליכה, חלק ובלי קפיצות
+    const want=Math.atan2(flat.dot(this.cal.e2), flat.dot(this.cal.e1));
+    let d=want-this.yaw;
+    while(d> Math.PI) d-=2*Math.PI;
+    while(d<-Math.PI) d+=2*Math.PI;
+    this.yaw += d*Math.min(1, dt*1.6);
+    this.pitch += (-0.03-this.pitch)*Math.min(1, dt*1.5);
+
+    // מתקדמים רק כשהמצלמה כבר פונה בערך לכיוון הנכון
+    const aligned=Math.max(0, Math.cos(d));
+    const step=this.forward().multiplyScalar(this.speed*0.62*aligned*dt);
+    const before=this.pos.clone();
+    this.tryMove(step);
+    if(this.pos.distanceTo(before) < 1e-5*this.cal.unitsPerMeter){
+      this.stuck=(this.stuck||0)+dt;
+      if(this.stuck>1.2){ this.tourIdx=(this.tourIdx+1)%this.spots.length; this.stuck=0; }
+    } else this.stuck=0;
+
+    const h=this.pos.dot(this.cal.up);
+    this.pos.addScaledVector(this.cal.up, this.eye-h);
+    this.cam.up.copy(this.cal.up);
+    this.cam.position.copy(this.pos);
+    const dir=this.forward().multiplyScalar(Math.cos(this.pitch))
+      .addScaledVector(this.cal.up, Math.sin(this.pitch));
+    this.cam.lookAt(this.pos.clone().add(dir));
+  }
+
   update(dt){
+    if(this.cfg.tour){ this.updateTour(dt); return; }
     const k=this.keys;
     let ix=(k.has('d')||k.has('arrowright')?1:0)-(k.has('a')||k.has('arrowleft')?1:0);
     let iy=(k.has('w')||k.has('arrowup')?1:0)-(k.has('s')||k.has('arrowdown')?1:0);
@@ -481,8 +530,25 @@ function calibrate(viewer, THREE){
     if(h>kneeH && h<headH) blocked[j*W+i]=1;        // רהיט/קיר בגובה גוף
     else if(h<floorTol)    floorHits[j*W+i]++;      // יש רצפה מתחת
   }
+  const walkable0=new Uint8Array(W*H);
+  for(let k=0;k<W*H;k++) walkable0[k] = (!blocked[k] && floorHits[k]>0) ? 1 : 0;
+
+  // שחיקה (erosion) של משבצת אחת: המצלמה לא מתקרבת לרהיט או לקיר יותר
+  // מ-18 ס"מ בערך. בלי זה גם ההליכה הידנית וגם הסיור האוטומטי נצמדים
+  // לווילון או לפינה, והתמונה יוצאת מרוחה לגמרי.
   const walkable=new Uint8Array(W*H);
-  for(let k=0;k<W*H;k++) walkable[k] = (!blocked[k] && floorHits[k]>0) ? 1 : 0;
+  for(let j=0;j<H;j++)for(let i=0;i<W;i++){
+    if(!walkable0[j*W+i]) continue;
+    let ok=true;
+    for(let dj=-1;dj<=1&&ok;dj++)for(let di=-1;di<=1&&ok;di++){
+      const a=i+di,b=j+dj;
+      if(a<0||b<0||a>=W||b>=H||!walkable0[b*W+a]) ok=false;
+    }
+    if(ok) walkable[j*W+i]=1;
+  }
+  // אם השחיקה חנקה את כל החדר (חלל קטן מאוד), חוזרים למפה המקורית
+  let cnt=0; for(let k=0;k<W*H;k++) cnt+=walkable[k];
+  if(cnt < 12) walkable.set(walkable0);
 
   // מרכז השטח ההליך — לשם מכוונים את המבט הראשון
   let sc1=0, sc2=0, scn=0;
